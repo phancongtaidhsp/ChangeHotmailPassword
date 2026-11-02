@@ -1,10 +1,12 @@
 const axios = require("axios");
 const { HttpsProxyAgent } = require("https-proxy-agent");
-const { getCodeFviainboxesByEmail, getCodeSmvMailByEmail, delay } = require("./helper");
+const { getCodeFviainboxesByEmail, getCodeSmvMailByEmail, getCodeTmMailByEmail, delay } = require("./helper");
 const { normalizeProxyUrl } = require("./proxy");
 
 const MAX_ACCRUE_RESTARTS = 1;
 const MAX_PASSWORD_ATTEMPTS = 2;
+const FVIA_MAIL_DOMAINS = ["fviamail.work", "fviadropinbox.com", "fviainboxes.com", "dropinboxes.com"];
+const SMV_MAIL_DOMAINS = ["smvmail.com"];
 
 function isRetryableHttpStatus(status) {
   return status === 429 || status >= 500;
@@ -60,6 +62,8 @@ class HotmailClass {
     this.otp = null;
     this.phone = null;
     this.recoveryEmail = recoveryEmail;
+    // Existing Mail.tm inboxes use the helper's default unless explicitly configured.
+    this.tmMailPassword = undefined;
     this.recoveryEmailProof = null;
     this.phoneFormat = null;
     this.recommendedChallengeRiskScore = null;
@@ -308,11 +312,7 @@ class HotmailClass {
         if (!this.recoveryEmailProof.data || !this.flowtoken)
           return { status: "error", message: "Không lấy được thông tin submit OTP mail khôi phục" };
 
-        let code = null;
-        if (this.recoveryEmail.includes("fviainboxes.com"))
-          code = await getCodeFviainboxesByEmail(this.recoveryEmail, this.proxy, this.abortSignal);
-        if (this.recoveryEmail.includes("smvmail.com"))
-          code = await getCodeSmvMailByEmail(this.recoveryEmail, this.proxy, this.abortSignal);
+        const code = await this._getRecoveryEmailCode();
         if (!code)
           return {
             status: "error",
@@ -1820,15 +1820,29 @@ class HotmailClass {
   // ─────────────────────────────────────────────
   // GET OTP MAIL
   // ─────────────────────────────────────────────
+  async _getRecoveryEmailCode() {
+    const email = this.recoveryEmail?.trim().toLowerCase();
+    const domain = email?.split("@")[1];
+    if (!domain || this.abortSignal?.aborted) return null;
+    if (FVIA_MAIL_DOMAINS.includes(domain)) {
+      return getCodeFviainboxesByEmail(email, this.proxy, this.abortSignal);
+    }
+    if (SMV_MAIL_DOMAINS.includes(domain)) {
+      return getCodeSmvMailByEmail(email, this.proxy, this.abortSignal);
+    }
+    // Mail.tm domains rotate; authenticate the actual inbox instead of fixing one domain.
+    return getCodeTmMailByEmail(email, this.proxy, this.abortSignal, this.tmMailPassword);
+  }
+
   async GetOtpMail() {
-    const parts = this.recoveryEmail.split("@");
+    if (!this.recoveryEmail || this.abortSignal?.aborted) {
+      return { success: false, message: "Không có OTP từ mail khôi phục" };
+    }
+    const parts = this.recoveryEmail.trim().toLowerCase().split("@");
     const domain = parts[1];
     logWithTime("info", `${this.username} Lấy otp từ mail: ${this.recoveryEmail}`);
 
-    const fviaDomains = ["fviamail.work", "fviadropinbox.com", "fviainboxes.com", "dropinboxes.com"];
-    const smvDomains = ["smvmail.com"];
-
-    if (fviaDomains.includes(domain)) {
+    if (FVIA_MAIL_DOMAINS.includes(domain)) {
       let cnt = 60;
       while (cnt-- > 0) {
         try {
@@ -1860,7 +1874,7 @@ class HotmailClass {
       }
     }
 
-    if (smvDomains.includes(domain)) {
+    if (SMV_MAIL_DOMAINS.includes(domain)) {
       let cnt = 60;
       while (cnt-- > 0) {
         try {
@@ -1885,7 +1899,11 @@ class HotmailClass {
       }
     }
 
-    return { success: false, message: `Không có OTP từ mail khôi phục ${this.phone}` };
+    if (!FVIA_MAIL_DOMAINS.includes(domain) && !SMV_MAIL_DOMAINS.includes(domain)) {
+      const code = await this._getRecoveryEmailCode();
+      if (code) return { success: true, message: code };
+    }
+    return { success: false, message: `Không có OTP từ mail khôi phục ${this.recoveryEmail}` };
   }
 
   // ─────────────────────────────────────────────
@@ -2369,14 +2387,17 @@ class HotmailClass {
   async _generateEmail() {
     const localOrig = this.email.split("@")[0];
     const localPart = this.mailIsOg ? localOrig : `${localOrig}${this.mailCustomStr}`;
-    const mailDomain = this.mailSite ?? "fviainboxes.com";
+    const mailDomain = (this.mailSite ?? "fviainboxes.com").trim().toLowerCase();
     this.recoveryEmail = `${localPart}@${mailDomain}`.toLowerCase();
 
-    if (mailDomain === "dollicons.com") {
+    if (!FVIA_MAIL_DOMAINS.includes(mailDomain) && !SMV_MAIL_DOMAINS.includes(mailDomain)) {
+      this.tmMailPassword = this.tmMailPassword ?? this.password;
       for (let retry = 0; retry < 3; retry++) {
         try {
           await axios.post("https://api.mail.tm/accounts", {
-            address: this.recoveryEmail, password: this.password,
+            address: this.recoveryEmail, password: this.tmMailPassword,
+          }, {
+            timeout: 15000, signal: this.abortSignal,
           });
           break;
         } catch (ex) {
