@@ -1,5 +1,4 @@
 const axios = require('axios-https-proxy-fix');
-const axiosDefault = require('axios');
 const cheerio = require('cheerio');
 const { toAxiosProxy } = require('./proxy');
 
@@ -7,12 +6,22 @@ const instance = axios.create({
   timeout: 15000,
 })
 
-const instanceDefault = axiosDefault.create({
-  timeout: 15000,
-})
-
 const OTP_WAIT_TIMEOUT_MS = 30000;
 const REQUEST_TIMEOUT_MS = 15000;
+
+const requestTm = async (options) => {
+  if (!options.signal) return instance.request(options);
+  // axios-https-proxy-fix uses CancelToken rather than AbortSignal.
+  const cancellation = axios.CancelToken.source();
+  const abort = () => cancellation.cancel('Mail.tm request cancelled');
+  options.signal.addEventListener('abort', abort, { once: true });
+  if (options.signal.aborted) abort();
+  try {
+    return await instance.request({ ...options, cancelToken: cancellation.token });
+  } finally {
+    options.signal.removeEventListener('abort', abort);
+  }
+}
 
 const delay = (ms) => {
   return new Promise(resolve => setTimeout(resolve, ms));
@@ -202,7 +211,8 @@ const reportTmError = (operation, error) => {
   console.error(`[Mail.tm] ${operation}: ${status ? `HTTP ${status}` : error.code || 'request failed'}`);
 }
 
-const createTmEmail = async (email, password = DEFAULT_TM_PASSWORD) => {
+const createTmEmail = async (email, password = DEFAULT_TM_PASSWORD, requestOptions = {}) => {
+  if (requestOptions.signal?.aborted) return null;
   let data = JSON.stringify({
     "address": email,
     "password": password
@@ -215,9 +225,12 @@ const createTmEmail = async (email, password = DEFAULT_TM_PASSWORD) => {
         'accept': 'application/ld+json', 
         'Content-Type': 'application/ld+json'
       },
-      data: data
+      data: data,
+      timeout: requestOptions.timeout ?? REQUEST_TIMEOUT_MS,
+      signal: requestOptions.signal,
+      ...(requestOptions.proxy ? { proxy: requestOptions.proxy } : {}),
     };
-    instanceDefault.request(options)
+    requestTm(options)
       .then(function (response) {
         if (response?.data?.id) {
           resolve(response.data.id);
@@ -225,7 +238,7 @@ const createTmEmail = async (email, password = DEFAULT_TM_PASSWORD) => {
           resolve(null);
         }
       }).catch((e) => {
-        reportTmError('Không tạo được tài khoản', e);
+        if (!requestOptions.signal?.aborted) reportTmError('Không tạo được tài khoản', e);
         resolve(null);
       });
   })
@@ -250,7 +263,7 @@ const getTokenTmEmail = async (email, password = DEFAULT_TM_PASSWORD, requestOpt
       signal: requestOptions.signal,
       ...(requestOptions.proxy ? { proxy: requestOptions.proxy } : {}),
     };
-    instanceDefault.request(options)
+    requestTm(options)
       .then(function (response) {
         if (response?.data?.token) {
           resolve(response.data.token);
@@ -308,7 +321,7 @@ const findCodeTmEmail = async (token, signal, { proxy, deadline = Infinity } = {
     let hasNextPage;
     do {
       if (Date.now() >= deadline || signal?.aborted) return null;
-      const response = await instanceDefault.request({
+      const response = await requestTm({
         method: 'GET', url: 'https://api.mail.tm/messages',
         headers, params: { page }, signal,
         timeout: getRemainingTimeout(deadline),
@@ -325,7 +338,7 @@ const findCodeTmEmail = async (token, signal, { proxy, deadline = Infinity } = {
         let detail = {};
         if (message.id) {
           try {
-            const response = await instanceDefault.request({
+            const response = await requestTm({
               method: 'GET', url: `https://api.mail.tm/messages/${encodeURIComponent(message.id)}`,
               headers, signal,
               timeout: getRemainingTimeout(deadline),
@@ -370,17 +383,18 @@ const getCodeTmMailByEmail = async (email, proxyString, signal, password = DEFAU
   return null;
 }
 
-// if (require.main === module) {
-//   (async () => {
-//     const email = process.argv[2] || process.env.MAIL_TM_EMAIL || 'nitschkeyaovb55678@sharebot.net';
-//     const code = await getCodeTmMailByEmail(email, null, undefined, process.env.MAIL_TM_PASSWORD);
-//     console.log(code || '[Mail.tm] Chưa tìm thấy mã Microsoft trong hộp thư.');
-//     if (!code) process.exitCode = 1;
-//   })().catch(() => {
-//     console.error('[Mail.tm] Không thể hoàn tất kiểm tra hộp thư.');
-//     process.exitCode = 1;
-//   });
-// }
+if (require.main === module) {
+  (async () => {
+    const email = process.argv[2] || process.env.MAIL_TM_EMAIL || 'nitschkeyaovb55678@sharebot.net';
+    const proxy = process.argv[3] || process.env.MAIL_TM_PROXY;
+    const code = await getCodeTmMailByEmail(email, proxy, undefined, process.env.MAIL_TM_PASSWORD);
+    console.log(code || '[Mail.tm] Chưa tìm thấy mã Microsoft trong hộp thư.');
+    if (!code) process.exitCode = 1;
+  })().catch(() => {
+    console.error('[Mail.tm] Không thể hoàn tất kiểm tra hộp thư.');
+    process.exitCode = 1;
+  });
+}
 
 module.exports = {
   delay,
